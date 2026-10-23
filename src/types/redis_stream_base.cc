@@ -167,7 +167,7 @@ Status DecodeRawStreamEntryValue(const std::string &value, std::vector<std::stri
 
   while (!s.empty()) {
     uint32_t len = 0;
-    if (!GetVarint32(&s, &len)) {
+    if (!GetVarint32(&s, &len) || len > s.size()) {
       return {Status::RedisParseErr, kErrDecodingStreamEntryValueFailure};
     }
 

@@ -2760,6 +2760,134 @@ func TestStreamOffset(t *testing.T) {
 
 		require.NoError(t, rdb.Del(ctx, streamKey).Err())
 	})
+
+	t.Run("XPENDING only reports the pending entries of the given group", func(t *testing.T) {
+		streamKey := "xpending-multi-group-test"
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		for i := 1; i <= 5; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: streamKey, ID: fmt.Sprintf("%d-0", i), Values: []string{"f", "v"}}).Err())
+		}
+		require.NoError(t, rdb.XGroupCreate(ctx, streamKey, "a", "0").Err())
+		require.NoError(t, rdb.XGroupCreate(ctx, streamKey, "b", "0").Err())
+		require.NoError(t, rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "a", Consumer: "c1", Streams: []string{streamKey, ">"}, Block: -1}).Err())
+		require.NoError(t, rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "b", Consumer: "c2", Streams: []string{streamKey, ">"}, Count: 2, Block: -1}).Err())
+
+		summary, err := rdb.XPending(ctx, streamKey, "a").Result()
+		require.NoError(t, err)
+		require.Equal(t, &redis.XPending{Count: 5, Lower: "1-0", Higher: "5-0", Consumers: map[string]int64{"c1": 5}}, summary)
+		summary, err = rdb.XPending(ctx, streamKey, "b").Result()
+		require.NoError(t, err)
+		require.Equal(t, &redis.XPending{Count: 2, Lower: "1-0", Higher: "2-0", Consumers: map[string]int64{"c2": 2}}, summary)
+
+		entries, err := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{Stream: streamKey, Group: "a", Start: "-", End: "+", Count: 10}).Result()
+		require.NoError(t, err)
+		require.Len(t, entries, 5)
+		for _, entry := range entries {
+			require.Equal(t, "c1", entry.Consumer)
+		}
+
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+	})
+
+	t.Run("XREADGROUP of pending history without COUNT returns all pending entries", func(t *testing.T) {
+		streamKey := "xreadgroup-history-no-count-test"
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		for i := 1; i <= 5; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: streamKey, ID: fmt.Sprintf("%d-0", i), Values: []string{"f", "v"}}).Err())
+		}
+		require.NoError(t, rdb.XGroupCreate(ctx, streamKey, "g", "0").Err())
+		require.NoError(t, rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "g", Consumer: "c", Streams: []string{streamKey, ">"}, Block: -1}).Err())
+
+		result, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "g", Consumer: "c", Streams: []string{streamKey, "0"}, Block: -1}).Result()
+		require.NoError(t, err)
+		require.Len(t, result, 1)
+		require.Len(t, result[0].Messages, 5)
+		require.Equal(t, "1-0", result[0].Messages[0].ID)
+		require.Equal(t, "5-0", result[0].Messages[4].ID)
+
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+	})
+
+	t.Run("XDEL keeps the first and last entry valid when deleting entries at either end", func(t *testing.T) {
+		streamKey := "xdel-first-last-test"
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		for i := 1; i <= 6; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: streamKey, ID: fmt.Sprintf("%d-0", i), Values: []string{"f", "v"}}).Err())
+		}
+
+		require.EqualValues(t, 2, rdb.XDel(ctx, streamKey, "5-0", "6-0").Val())
+		require.EqualValues(t, 2, rdb.XDel(ctx, streamKey, "2-0", "1-0").Val())
+		info, err := rdb.XInfoStream(ctx, streamKey).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, 2, info.Length)
+		require.Equal(t, "3-0", info.FirstEntry.ID)
+		require.Equal(t, "4-0", info.LastEntry.ID)
+
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+	})
+
+	t.Run("XDEL, XACK and XCLAIM count duplicate IDs once", func(t *testing.T) {
+		streamKey := "stream-duplicate-ids-test"
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		for i := 1; i <= 5; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: streamKey, ID: fmt.Sprintf("%d-0", i), Values: []string{"f", "v"}}).Err())
+		}
+
+		require.EqualValues(t, 1, rdb.XDel(ctx, streamKey, "5-0", "5-0").Val())
+		require.EqualValues(t, 4, rdb.XLen(ctx, streamKey).Val())
+
+		require.NoError(t, rdb.XGroupCreate(ctx, streamKey, "g", "0").Err())
+		require.NoError(t, rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "g", Consumer: "c1", Streams: []string{streamKey, ">"}, Block: -1}).Err())
+		require.EqualValues(t, 1, rdb.XAck(ctx, streamKey, "g", "1-0", "1-0").Val())
+
+		ids, err := rdb.XClaimJustID(ctx, &redis.XClaimArgs{Stream: streamKey, Group: "g", Consumer: "c2", Messages: []string{"2-0", "2-0"}}).Result()
+		require.NoError(t, err)
+		require.Equal(t, []string{"2-0"}, ids)
+
+		groups, err := rdb.XInfoGroups(ctx, streamKey).Result()
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+		require.EqualValues(t, 3, groups[0].Pending)
+		consumers, err := rdb.XInfoConsumers(ctx, streamKey, "g").Result()
+		require.NoError(t, err)
+		pending := map[string]int64{}
+		for _, consumer := range consumers {
+			pending[consumer.Name] = consumer.Pending
+		}
+		require.Equal(t, map[string]int64{"c1": 2, "c2": 1}, pending)
+
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+	})
+
+	t.Run("XCLAIM keeps consumer pending counts consistent", func(t *testing.T) {
+		streamKey := "xclaim-pending-counts-test"
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+		for i := 1; i <= 3; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: streamKey, ID: fmt.Sprintf("%d-0", i), Values: []string{"f", "v"}}).Err())
+		}
+		require.NoError(t, rdb.XGroupCreate(ctx, streamKey, "g", "0").Err())
+		require.NoError(t, rdb.XReadGroup(ctx, &redis.XReadGroupArgs{Group: "g", Consumer: "c1", Streams: []string{streamKey, ">"}, Block: -1}).Err())
+
+		consumerPending := func() map[string]int64 {
+			consumers, err := rdb.XInfoConsumers(ctx, streamKey, "g").Result()
+			require.NoError(t, err)
+			pending := map[string]int64{}
+			for _, consumer := range consumers {
+				pending[consumer.Name] = consumer.Pending
+			}
+			return pending
+		}
+
+		// Claiming several entries from the same owner decrements it once per entry
+		require.NoError(t, rdb.XClaimJustID(ctx, &redis.XClaimArgs{Stream: streamKey, Group: "g", Consumer: "c2", Messages: []string{"1-0", "2-0"}}).Err())
+		require.Equal(t, map[string]int64{"c1": 1, "c2": 2}, consumerPending())
+
+		// Claiming an entry the consumer already owns leaves its count unchanged
+		require.NoError(t, rdb.XClaimJustID(ctx, &redis.XClaimArgs{Stream: streamKey, Group: "g", Consumer: "c1", Messages: []string{"3-0"}}).Err())
+		require.Equal(t, map[string]int64{"c1": 1, "c2": 2}, consumerPending())
+
+		require.NoError(t, rdb.Del(ctx, streamKey).Err())
+	})
 }
 
 func parseStreamEntryID(id string) (ts int64, seqNum int64) {

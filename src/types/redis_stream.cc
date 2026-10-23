@@ -23,6 +23,8 @@
 #include <rocksdb/status.h>
 
 #include <memory>
+#include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -352,7 +354,10 @@ rocksdb::Status Stream::DeletePelEntries(engine::Context &ctx, const Slice &stre
   if (!s.ok()) return s;
 
   std::map<std::string, uint64_t> consumer_acknowledges;
+  std::set<StreamEntryID> seen_ids;
   for (const auto &id : entry_ids) {
+    if (!seen_ids.insert(id).second) continue;
+
     std::string entry_key = internalPelKeyFromGroupAndEntryId(ns_key, metadata, group_name, id);
     std::string value;
     s = storage_->Get(ctx, ctx.GetReadOptions(), stream_cf_handle_, entry_key, &value);
@@ -437,7 +442,13 @@ rocksdb::Status Stream::ClaimPelEntries(engine::Context &ctx, const Slice &strea
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+  // A batch Put does not show up in later reads, so decrements to the previous owners are summed here
+  // and written once after the loop.
+  std::map<std::string, uint64_t> original_consumer_decrements;
+  std::set<StreamEntryID> seen_ids;
   for (const auto &id : entry_ids) {
+    if (!seen_ids.insert(id).second) continue;
+
     std::string raw_value;
     rocksdb::Status s = getEntryRawValue(ctx, ns_key, metadata, id, &raw_value);
     if (!s.ok() && !s.IsNotFound()) {
@@ -473,21 +484,10 @@ rocksdb::Status Stream::ClaimPelEntries(engine::Context &ctx, const Slice &strea
         result->entries.emplace_back(id.ToString(), std::move(values));
       }
 
-      if (pel_entry.consumer_name != "") {
-        std::string original_consumer_key =
-            internalKeyFromConsumerName(ns_key, metadata, group_name, pel_entry.consumer_name);
-        std::string get_original_consumer_value;
-        s = storage_->Get(ctx, ctx.GetReadOptions(), stream_cf_handle_, original_consumer_key,
-                          &get_original_consumer_value);
-        if (!s.ok()) {
-          return s;
-        }
-        StreamConsumerMetadata original_consumer_metadata =
-            decodeStreamConsumerMetadataValue(get_original_consumer_value);
-        original_consumer_metadata.pending_number -= 1;
-        s = batch->Put(stream_cf_handle_, original_consumer_key,
-                       encodeStreamConsumerMetadataValue(original_consumer_metadata));
-        if (!s.ok()) return s;
+      if (pel_entry.consumer_name == consumer_name) {
+        consumer_metadata.pending_number -= 1;
+      } else if (!pel_entry.consumer_name.empty()) {
+        original_consumer_decrements[pel_entry.consumer_name]++;
       }
 
       pel_entry.consumer_name = consumer_name;
@@ -512,6 +512,22 @@ rocksdb::Status Stream::ClaimPelEntries(engine::Context &ctx, const Slice &strea
       s = batch->Put(stream_cf_handle_, entry_key, pel_value);
       if (!s.ok()) return s;
     }
+  }
+
+  for (const auto &[original_consumer_name, decrement] : original_consumer_decrements) {
+    std::string original_consumer_key =
+        internalKeyFromConsumerName(ns_key, metadata, group_name, original_consumer_name);
+    std::string get_original_consumer_value;
+    s = storage_->Get(ctx, ctx.GetReadOptions(), stream_cf_handle_, original_consumer_key,
+                      &get_original_consumer_value);
+    if (!s.ok()) {
+      return s;
+    }
+    StreamConsumerMetadata original_consumer_metadata = decodeStreamConsumerMetadataValue(get_original_consumer_value);
+    original_consumer_metadata.pending_number -= decrement;
+    s = batch->Put(stream_cf_handle_, original_consumer_key,
+                   encodeStreamConsumerMetadataValue(original_consumer_metadata));
+    if (!s.ok()) return s;
   }
 
   if (options.with_last_id && options.last_delivered_id > group_metadata.last_delivered_id) {
@@ -1017,48 +1033,61 @@ rocksdb::Status Stream::DeleteEntries(engine::Context &ctx, const Slice &stream_
 
   auto iter = util::UniqueIterator(ctx, read_options, stream_cf_handle_);
 
+  std::set<StreamEntryID> deleted_ids;
   for (const auto &id : ids) {
+    if (deleted_ids.count(id) > 0) continue;
+
     std::string entry_key = internalKeyFromEntryID(ns_key, metadata, id);
     std::string value;
     s = storage_->Get(ctx, read_options, stream_cf_handle_, entry_key, &value);
-    if (s.ok()) {
-      *deleted_cnt += 1;
-      s = batch->Delete(stream_cf_handle_, entry_key);
-      if (!s.ok()) return s;
+    if (!s.ok()) continue;
 
-      if (metadata.max_deleted_entry_id < id) {
-        metadata.max_deleted_entry_id = id;
-      }
+    s = batch->Delete(stream_cf_handle_, entry_key);
+    if (!s.ok()) return s;
+    deleted_ids.insert(id);
 
-      if (*deleted_cnt == metadata.size) {
-        metadata.first_entry_id.Clear();
-        metadata.last_entry_id.Clear();
-        metadata.recorded_first_entry_id.Clear();
-        break;
-      }
+    if (metadata.max_deleted_entry_id < id) {
+      metadata.max_deleted_entry_id = id;
+    }
 
-      if (id == metadata.first_entry_id) {
-        iter->Seek(entry_key);
+    if (deleted_ids.size() == metadata.size) break;
+  }
+  *deleted_cnt = deleted_ids.size();
+
+  // The iterator does not see the deletes pending in the batch, so the new first/last entries are the
+  // nearest entries that are not being deleted by this call.
+  if (*deleted_cnt == metadata.size) {
+    metadata.first_entry_id.Clear();
+    metadata.last_entry_id.Clear();
+    metadata.recorded_first_entry_id.Clear();
+  } else if (*deleted_cnt > 0) {
+    if (deleted_ids.count(metadata.first_entry_id) > 0) {
+      iter->Seek(internalKeyFromEntryID(ns_key, metadata, metadata.first_entry_id));
+      while (iter->Valid() && deleted_ids.count(entryIDFromInternalKey(iter->key())) > 0) {
         iter->Next();
-        if (iter->Valid()) {
-          metadata.first_entry_id = entryIDFromInternalKey(iter->key());
-          metadata.recorded_first_entry_id = metadata.first_entry_id;
-        } else {
-          metadata.first_entry_id.Clear();
-          metadata.recorded_first_entry_id.Clear();
-        }
       }
-
-      if (id == metadata.last_entry_id) {
-        iter->Seek(entry_key);
-        iter->Prev();
-        if (iter->Valid()) {
-          metadata.last_entry_id = entryIDFromInternalKey(iter->key());
-        } else {
-          metadata.last_entry_id.Clear();
-        }
+      if (iter->Valid()) {
+        metadata.first_entry_id = entryIDFromInternalKey(iter->key());
+        metadata.recorded_first_entry_id = metadata.first_entry_id;
+      } else {
+        metadata.first_entry_id.Clear();
+        metadata.recorded_first_entry_id.Clear();
       }
     }
+
+    if (deleted_ids.count(metadata.last_entry_id) > 0) {
+      iter->Seek(internalKeyFromEntryID(ns_key, metadata, metadata.last_entry_id));
+      while (iter->Valid() && deleted_ids.count(entryIDFromInternalKey(iter->key())) > 0) {
+        iter->Prev();
+      }
+      if (iter->Valid()) {
+        metadata.last_entry_id = entryIDFromInternalKey(iter->key());
+      } else {
+        metadata.last_entry_id.Clear();
+      }
+    }
+
+    if (auto st = iter->status(); !st.ok()) return st;
   }
 
   if (*deleted_cnt > 0) {
@@ -1584,7 +1613,7 @@ rocksdb::Status Stream::RangeWithPending(engine::Context &ctx, const Slice &stre
       s = batch->Put(stream_cf_handle_, iter->key(), encodeStreamPelEntryValue(pel_entry));
       if (!s.ok()) return s;
       ++count;
-      if (count >= options.count) break;
+      if (options.with_count && count >= options.count) break;
     }
 
     if (auto s = iter->status(); !s.ok()) {
@@ -1808,11 +1837,13 @@ rocksdb::Status Stream::GetPendingEntries(engine::Context &ctx, StreamPendingOpt
   std::string prefix_key = internalPelKeyFromGroupAndEntryId(ns_key, metadata, group_name, scan_start_id);
   // XPENDING extended form follows XRANGE-style ranges (closed interval by default; '(' excludes an endpoint).
   // RocksDB iterate_upper_bound is exclusive.
+  // The PEL keys of other groups follow this group's, so an unbounded end must stop right after this
+  // group's maximum entry ID rather than at the end of the stream's key space.
+  std::string group_pel_end =
+      internalPelKeyFromGroupAndEntryId(ns_key, metadata, group_name, StreamEntryID::Maximum()) + '\0';
   std::string end_key_exclusive;
   if (options.end_id == StreamEntryID::Maximum()) {
-    // "+" means no upper ID limit; place the bound after all keys in this stream metadata version
-    // (same pattern as Stream::trim). A PEL-specific key cannot be "past" maximum ID.
-    end_key_exclusive = InternalKey(ns_key, "", metadata.version + 1, storage_->IsSlotIdEncoded()).Encode();
+    end_key_exclusive = group_pel_end;
   } else if (options.exclude_end) {
     // Exclusive end: iterator keys must be strictly before end_id.
     end_key_exclusive = internalPelKeyFromGroupAndEntryId(ns_key, metadata, group_name, options.end_id);
@@ -1820,7 +1851,7 @@ rocksdb::Status Stream::GetPendingEntries(engine::Context &ctx, StreamPendingOpt
     StreamEntryID end_next = options.end_id;
     Status inc_st = IncrementStreamEntryID(&end_next);
     if (!inc_st.IsOK()) {
-      end_key_exclusive = InternalKey(ns_key, "", metadata.version + 1, storage_->IsSlotIdEncoded()).Encode();
+      end_key_exclusive = group_pel_end;
     } else {
       // Next ID after end_id in PEL key space — exclusive iterator upper bound (XRANGE closed end).
       end_key_exclusive = internalPelKeyFromGroupAndEntryId(ns_key, metadata, group_name, end_next);
@@ -1834,7 +1865,7 @@ rocksdb::Status Stream::GetPendingEntries(engine::Context &ctx, StreamPendingOpt
   read_options.iterate_lower_bound = &lower_bound;
 
   auto iter = util::UniqueIterator(ctx, read_options, stream_cf_handle_);
-  std::unordered_set<std::string> consumer_names;
+  std::unordered_map<std::string, size_t> consumer_index;
   StreamEntryID first_entry_id{StreamEntryID::Maximum()};
   StreamEntryID last_entry_id{StreamEntryID::Minimum()};
   uint64_t ext_result_count = 0;
@@ -1869,21 +1900,11 @@ rocksdb::Status Stream::GetPendingEntries(engine::Context &ctx, StreamPendingOpt
       ext_result_count++;
       continue;
     }
-    std::string consumer_key = internalKeyFromConsumerName(ns_key, metadata, group_name, consumer_name);
-    std::string get_consumer_value;
-    s = storage_->Get(ctx, ctx.GetReadOptions(), stream_cf_handle_, consumer_key, &get_consumer_value);
-    if (!s.ok() && !s.IsNotFound()) {
-      return s;
+    auto [it, inserted] = consumer_index.try_emplace(consumer_name, pending_infos.consumer_infos.size());
+    if (inserted) {
+      pending_infos.consumer_infos.emplace_back(consumer_name, 0);
     }
-    if (s.IsNotFound()) {
-      return rocksdb::Status::OK();
-    }
-
-    StreamConsumerMetadata consumer_metadata = decodeStreamConsumerMetadataValue(get_consumer_value);
-    if (consumer_names.find(consumer_name) == consumer_names.end()) {
-      consumer_names.insert(consumer_name);
-      pending_infos.consumer_infos.emplace_back(consumer_name, consumer_metadata.pending_number);
-    }
+    pending_infos.consumer_infos[it->second].second++;
     summary_result_count++;
   }
   pending_infos.last_entry_id = last_entry_id;

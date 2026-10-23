@@ -258,7 +258,7 @@ struct StreamPendingOptions {
 };
 
 struct StreamGetPendingEntryResult {
-  uint64_t pending_number;
+  uint64_t pending_number = 0;
   StreamEntryID first_entry_id;
   StreamEntryID last_entry_id;
   std::vector<std::pair<std::string, int>> consumer_infos;

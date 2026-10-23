@@ -51,6 +51,18 @@ class RedisStreamTest : public TestBase {  // NOLINT
   redis::Stream *stream_;
 };
 
+TEST(StreamEntryValueTest, DecodeRejectsLengthPastEndOfValue) {
+  std::vector<std::string> values;
+  auto encoded = redis::EncodeStreamEntryValue({"field", "value"});
+  EXPECT_TRUE(redis::DecodeRawStreamEntryValue(encoded, &values).IsOK());
+  EXPECT_EQ(values, std::vector<std::string>({"field", "value"}));
+
+  // Truncating the value leaves the last length larger than the bytes that follow it
+  EXPECT_FALSE(redis::DecodeRawStreamEntryValue(encoded.substr(0, encoded.size() - 1), &values).IsOK());
+  const std::string length_past_end = {'\x05', 'a', 'b'};
+  EXPECT_FALSE(redis::DecodeRawStreamEntryValue(length_past_end, &values).IsOK());
+}
+
 TEST_F(RedisStreamTest, ParsingNextStreamEntryID) {
   EXPECT_FALSE(ParseNextStreamEntryIDStrategy("XYX-ABC").IsOK());
   EXPECT_FALSE(ParseNextStreamEntryIDStrategy("ABC-100").IsOK());
